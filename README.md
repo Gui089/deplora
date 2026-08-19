@@ -3,125 +3,144 @@
 </p>
 
 <p align="center">
-  <strong>O agente que constrói o deploy com você — e lamenta junto quando quebra.</strong><br>
-  PaaS open source com GitHub Actions oficiais e diagnóstico de deploy por IA.
+  <strong>Cole a URL do repositório. Diga onde quer que rode. O resto é com o Deplora.</strong><br>
+  O agente que transforma um repositório em algo no ar — explicando cada passo, e lamentando junto quando quebra.
 </p>
 
 <p align="center">
-  <img src="docs/brand/deploy-demo.gif" alt="Um deploy no Deplora: push, build, falha no Java 21 × temurin:17, o agente lamenta e propõe a correção, build passa, no ar em 1m 42s" width="900">
+  <img src="docs/brand/deploy-demo.gif" alt="Um deploy no Deplora: análise do repositório, build, falha no Java 21 × temurin:17, o agente lamenta e propõe a correção, build passa, no ar em 1m 42s" width="900">
 </p>
 
 <p align="center">
-  <code>Spring Boot</code> · <code>Quarkus</code> · <code>Node.js</code> · <code>Docker</code> · <code>GitHub Actions</code> · <code>MCP</code>
+  <code>Java</code> · <code>Spring Boot</code> · <code>Quarkus</code> · <code>Node.js</code> · <code>Docker Engine API</code> · <code>SSH</code> · <code>LLM</code>
 </p>
 
 ---
 
 > **Status: em construção, em público.** O Deplora é o projeto-laboratório de duas pós-graduações
-> (Java · Engenharia de IA) — e o `git log` é o histórico de aprendizado, um PR por módulo.
+> (Java · Engenharia de IA). O `git log` é o histórico de aprendizado — um PR por conceito.
 > Este README descreve o que está sendo construído e em que ordem. O que já roda está marcado ✅.
 
-## O que é
+## O problema
 
-Você aponta um repositório. O Deplora monta o pipeline, acompanha o build e coloca o container no ar.
-Quando algo falha, ele não devolve um stack trace: **diz o quê, onde e como consertar** — e propõe
-a correção com um botão.
+Você gerou um app com IA. Ele roda no `localhost`. E agora?
+
+Pra colocar no ar, alguém precisa saber o que é uma imagem, uma porta, um health check, uma
+variável de ambiente, um Dockerfile, um provider. Quem faz *vibe coding* não sabe — e não deveria
+precisar. É aí que a maioria dos projetos de fim de semana morre: não no código, na **subida**.
+
+## O que o Deplora faz
+
+Você cola a URL do repositório e escolhe onde quer que rode. O Deplora:
+
+1. **Lê o repositório** e descobre linguagem, framework, comando de build e de start, porta, se
+   precisa de banco, quais variáveis faltam — sem você dizer nada.
+2. **Escreve o plano** em português claro e mostra antes de fazer qualquer coisa:
+   > "Seu app é Node 22, sobe com `node server.js`, escuta na porta 3000 e não precisa de banco.
+   > Falta a variável `OPENAI_API_KEY`. Quer subir pra onde?"
+3. **Constrói e testa localmente** — gera o Dockerfile, constrói a imagem, sobe, bate na porta,
+   confirma que responde.
+4. **Sobe no provider que você conectou** — seu VPS, Fly.io, Railway, AWS. O Deplora não hospeda;
+   ele orquestra o deploy pra onde você quiser.
+5. **Acompanha o primeiro boot.** Se quebrar, não devolve um stack trace: diz o quê, onde, e como
+   consertar — e propõe a correção com um botão.
 
 ```
 12:06:21  ✗ error: release version 21 not supported
-12:06:22  deplora › lamento — o projeto pede Java 21; a imagem base é 17.
+12:06:22  deplora › lamento — o projeto pede Java 21; a imagem base que eu escolhi é 17.
 12:06:22  deplora › troco para eclipse-temurin:21 e tento de novo? y
-12:07:44  ✓ no ar · https://api-pedidos.deplora.dev · 200 em 1m 42s
+12:07:44  ✓ no ar · https://api-pedidos.fly.dev · 200 em 1m 42s
 ```
 
 O nome é deploy + *deplorar* — lamentar. O produto ri do deploy que quebrou, mas existe para
-quebrar menos. **Sério na função, leve na voz.**
+que quebre menos. **Sério na função, leve na voz.**
+
+## O princípio: complexo por dentro, simples por fora
+
+> *"Vou construir um software muito complexo para deixar mais simples."*
+
+Essa assimetria é o produto. Por fora: uma URL, um plano, um botão, um link. Por dentro, o
+Deplora é construído **no nível mais baixo que faz sentido** — de propósito, porque cada camada
+de abstração que não se usa é uma camada que se aprende:
+
+| Camada | O que o Deplora **não** usa | O que faz no lugar |
+|---|---|---|
+| Detectar a stack | Buildpacks, Nixpacks | lê a árvore de arquivos e os manifestos com o próprio código; LLM só na ambiguidade |
+| Gerar o Dockerfile | templates, `docker init` | o agente escreve; o código valida (multi-stage, non-root, sem `latest`); **o build tem que passar** |
+| Construir e rodar | `docker build` / `docker run` por subprocess | fala com a **Docker Engine API** pelo socket Unix: contexto em tar, stream de build lido linha a linha, `containers/create` → `start` → `logs` → `wait` |
+| Subir num VPS | Ansible, Terraform | **SSH do zero** — conexão, chave, `exec`, instalar Docker, subir o container, proxy reverso |
+| Subir num provider | SDK oficial | cliente HTTP escrito à mão contra a API de cada um, atrás de um único port `Provider` |
+| Segredos | cofre externo | detecta o que falta, pede, **nunca persiste** — injeta direto no provider |
+
+A régua: *se a pessoa precisou aprender um conceito de infra pra seguir, o Deplora falhou.*
+
+## Como funciona
+
+```mermaid
+flowchart LR
+    U["URL do repo"] --> A["<b>analisar</b><br/>árvore + manifestos"]
+    A --> P["<b>plano</b><br/>em português claro"]
+    P --> S{"aprova?"}
+    S -- "ajusta" --> P
+    S -- "sim" --> D["<b>construir</b><br/>Dockerfile → Engine API"]
+    D --> T["<b>testar</b><br/>run local · health"]
+    T --> V["<b>subir</b><br/>VPS · Fly · Railway · AWS"]
+    V --> L["<b>no ar</b><br/>acompanha o boot"]
+    D -. "falhou" .-> X["<b>diagnosticar</b><br/>causa + correção"]
+    T -. "falhou" .-> X
+    L -. "quebrou" .-> X
+    X -. "aprova" .-> D
+
+    style A fill:#F2A83B33,stroke:#F2A83B,stroke-width:2px
+    style D fill:#F2A83B33,stroke:#F2A83B,stroke-width:2px
+    style V fill:#F2A83B33,stroke:#F2A83B,stroke-width:2px
+    style X fill:#6FA8EA33,stroke:#6FA8EA,stroke-width:2px
+```
+
+O verificador do agente é sempre **a realidade**: a imagem buildou? o container respondeu?
+o provider devolveu 200? Nenhum LLM dá nota ao trabalho de outro LLM aqui. O agente propõe;
+a pessoa aprova; o código executa; o mundo confirma.
 
 ## Por que três runtimes
 
 Não é vitrine. Cada peça roda onde a escolha é tecnicamente a certa — e dá pra defender em uma frase.
 
-```mermaid
-flowchart LR
-    GH["GitHub Actions<br/><code>uses: deplora/deploy@v1</code>"]
-    CP["<b>control plane</b><br/>Spring Boot<br/>apps · deploys · secrets"]
-    RN["<b>runner</b><br/>Quarkus nativo<br/>docker run · health · rota"]
-    GW["<b>gateway</b><br/>Node.js<br/>logs ao vivo · WebSocket"]
-    AI["<b>cérebro</b><br/>LLM + MCP<br/>por que falhou · o que fazer"]
-    UI["navegador"]
-
-    GH -- "imagem pronta" --> CP
-    CP -- "fila" --> RN
-    RN -- "eventos" --> CP
-    RN -- "stdout" --> GW
-    GW -- "ws" --> UI
-    CP -. "falhou" .-> AI
-    AI -. "causa + proposta" .-> CP
-
-    style CP fill:#F2A83B33,stroke:#F2A83B,stroke-width:2px
-    style RN fill:#F2A83B33,stroke:#F2A83B,stroke-width:2px
-    style GW fill:#F2A83B33,stroke:#F2A83B,stroke-width:2px
-    style AI fill:#6FA8EA33,stroke:#6FA8EA,stroke-width:2px
-```
-
 | Peça | Runtime | O argumento |
 |---|---|---|
-| **Control plane** — apps, ambientes, deploys, secrets, histórico | **Spring Boot** | domínio rico e de longa vida; DDD de verdade (`App`, `Deploy`, `Environment` são aggregates com regras); segurança séria. Onde Spring brilha |
-| **Runner** — recebe o artefato, sobe o container, health check, roteia, escala | **Quarkus nativo** | um por nó, tem que subir em milissegundos e usar pouca memória; fala com o Docker/K8s. É *o* caso de uso pra que o Quarkus existe |
-| **Gateway** — logs e métricas ao vivo de N containers para M navegadores | **Node.js** | I/O intensivo, milhares de conexões persistentes, quase zero CPU: o caso canônico do event loop. O dashboard React vive aqui |
-| **GitHub Action oficial** — `uses: deplora/deploy@v1` | **Node.js** | o runtime nativo do Actions. O Deplora **integra** com o Actions — não reimplementa o executor de workflows |
-| **Cérebro** — analisa a falha (log + diff + histórico), diz por quê, propõe rollback; agente de operações via MCP | LLM + MCP | diagnóstico de deploy por IA é dor real e ninguém resolveu bem em open source |
+| **Runner** — analisa o repo, escreve o Dockerfile, fala com o Docker Engine API e com SSH, testa | **Quarkus nativo** (Java) | roda na máquina da pessoa ou num nó descartável: precisa subir em milissegundos e pesar pouco. O núcleo de baixo nível do projeto vive aqui |
+| **Control plane** — projetos, planos aprovados, conexões de provider, histórico | **Spring Boot** | domínio rico e de longa vida; DDD de verdade; onde Spring brilha |
+| **CLI + gateway** — `npx deplora` como porta de entrada; logs de build e boot ao vivo no terminal e no navegador | **Node.js** | o terminal que a pessoa já tem aberto; I/O intensivo com WebSocket e backpressure: o caso canônico do event loop |
+| **Cérebro** — entende o repo onde os manifestos não bastam, escreve o primeiro Dockerfile, explica, diagnostica | LLM | a IA resolve a ambiguidade; o código e a realidade validam |
 
-**Fronteira de escopo, dita com clareza:** o Deplora não executa YAML de workflow. O Actions constrói;
-o Deplora recebe o artefato e faz o resto. Reimplementar o Actions seria um segundo produto.
+## O que torna isso difícil
 
-## A vida de um deploy
-
-```mermaid
-stateDiagram-v2
-    [*] --> Queued: push recebido (webhook do Actions)
-    Queued --> Building: runner livre
-    Building --> Live: health check OK · rota trocada
-    Building --> Failed: build/health falhou
-    Failed --> Building: agente propôs correção · humano aprovou
-    Live --> [*]
-    Failed --> [*]
-```
-
-Quatro estados — e são os mesmos quatro que a gota expressa (veja *Identidade*). O status não é
-uma coluna que alguém esquece de atualizar: é derivado de eventos do runner, e o control plane
-reconcilia quando os dois discordam.
-
-## O que torna isso difícil (o núcleo)
-
-O CRUD de apps é aquecimento. O projeto vale pelo que está aqui:
-
-1. **Orquestração confiável** — subir container, esperar health, trocar rota sem derrubar requisição
-   em voo, matar o antigo. Onde 90% dos PaaS caseiros morrem.
-2. **Zero-downtime de verdade** — blue-green, provado com carga rodando *durante* o deploy e zero
-   requisições perdidas. Medido, não prometido.
-3. **Stream de logs sob carga** — 50 containers falando, 20 navegadores ouvindo, sem estourar memória
-   no gateway. Backpressure de verdade em Node.
-4. **Estado distribuído** — control plane diz "Live", runner diz "morreu". Quem manda? Reconciliação,
-   idempotência, o deploy que chegou duas vezes.
-5. **IA com verificador externo** — o agente propõe; o deploy re-executado decide se ele acertou.
-   Evals com dataset de falhas reais antes de mexer no prompt. O agente nunca aplica rollback sozinho.
+1. **Código arbitrário de quem não sabe o que escreveu.** Detectar stack num repositório gerado
+   por IA é lidar com monorepos acidentais, scripts de start esquisitos, portas hardcoded.
+2. **O Dockerfile gerado tem que buildar.** E quando não builda, o loop detectar → construir →
+   falhar → entender → corrigir é o harness de verdade — com verificador externo e budget.
+3. **Docker sem o CLI.** Contexto em tar, stream multiplexado de stdout/stderr, ciclo de vida
+   de container, tudo por HTTP num socket Unix.
+4. **SSH do zero** e depois um proxy reverso com TLS num VPS que a pessoa nunca abriu.
+5. **Um port `Provider`, N implementações** — e a prova de que o port é bom é a segunda
+   implementação não exigir mudança no resto.
 
 ## Roadmap
 
 | Fase | Entrega | Runtime que entra | Estado |
 |---|---|---|---|
-| 0 | Identidade visual, arquitetura, este README | — | ✅ |
-| 1 | **Monólito feio**: Spring recebe webhook do Actions com URL de imagem, roda `docker run` local, mostra "no ar" numa página tosca | Spring Boot | ◻ |
-| 2 | Logs ao vivo no navegador | Node.js (gateway + React) | ◻ |
-| 3 | Runner separado, fila entre control plane e runner | Quarkus nativo | ◻ |
-| 4 | Action oficial publicada no Marketplace | Node.js (Action) | ◻ |
-| 5 | Diagnóstico de falha por IA, com evals e verificador | LLM | ◻ |
-| 6 | MCP server + agente de operações (propõe rollback, executa com aprovação) | MCP | ◻ |
-| 7 | Blue-green provado sob carga · Testcontainers · ArchUnit · o próprio Deplora deployado na AWS | — | ◻ |
+| 0 | Visão, arquitetura, identidade, este README | — | ✅ |
+| 1 | **Caminho feliz, feio**: app Node sem Dockerfile → analisar → Dockerfile gerado → build e run pela Docker Engine API → health na porta → plano na tela | Java puro (vira o runner) | ◻ |
+| 2 | Java (Gradle/Maven) e Python detectados; detector extensível | — | ◻ |
+| 3 | Control plane: projetos, planos, aprovação, histórico | Spring Boot | ◻ |
+| 4 | `npx deplora` + logs ao vivo | Node.js | ◻ |
+| 5 | Primeiro provider: **VPS via SSH** — o mais baixo nível de todos | — | ◻ |
+| 6 | Segundo provider via API HTTP (Fly.io ou Railway); o port `Provider` provado | — | ◻ |
+| 7 | O cérebro: LLM na ambiguidade, no Dockerfile inicial e no diagnóstico — **com evals antes** | LLM | ◻ |
+| 8 | `uses: deplora/deploy@v1` — o Actions como caminho alternativo | Node.js (Action) | ◻ |
+| 9 | AWS como terceiro provider · o Deplora subindo a si mesmo | — | ◻ |
 
-A regra que governa a ordem: **semana 1 é um monólito feio**. Impossível no horizonte, não no
-primeiro commit.
+A regra que governa a ordem: **a fase 1 é um caminho feliz e feio, de ponta a ponta, num
+repositório real.** Impossível no horizonte, não no primeiro commit.
 
 ## Identidade
 
@@ -140,9 +159,11 @@ propõe → pede permissão → executa.
 
 ## Documentação
 
+- [`docs/VISAO.md`](docs/VISAO.md) — para quem, o que faz e não faz, por que baixo nível, as fases
 - [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) — decisões, trade-offs e o que foi descartado
 - [`docs/brand/`](docs/brand/) — identidade: guia, mark (SVG), lockup, GIF
 
 ## Licença
 
-MIT — porque a ideia é que você faça deploy com ele, e que ele aprenda com cada deploy que quebrou.
+MIT — porque a ideia é que qualquer pessoa coloque o próprio app no ar, e que o Deplora aprenda
+com cada deploy que quebrou.

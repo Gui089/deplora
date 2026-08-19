@@ -2,148 +2,184 @@
 
 > Documento vivo. Descreve as decisões tomadas, os trade-offs aceitos e o que foi descartado —
 > e por quê. Cada fase do roadmap acrescenta uma seção; nenhuma apaga a anterior.
+> A visão de produto (para quem, o que faz) está em [VISAO.md](VISAO.md); aqui é o *como*.
 
-## 1. O problema
+## 1. O problema de engenharia
 
-Um PaaS tem cinco responsabilidades: receber código, transformá-lo em algo executável, rodá-lo
-com roteamento e escala, injetar configuração e segredos, e mostrar o que está acontecendo.
-A maioria dos PaaS caseiros morre na terceira (rodar de forma confiável) ou na quinta
-(observabilidade útil). O Deplora ataca as duas — e adiciona uma sexta responsabilidade que
-nenhum PaaS open source resolve bem: **explicar a falha**.
+Transformar **código arbitrário** — muitas vezes gerado por IA, sem Dockerfile, sem documentação,
+com a porta hardcoded — em um container que builda, sobe, responde, e vai parar no provider que
+a pessoa escolheu. E fazer isso explicando cada passo em linguagem de quem nunca ouviu falar em
+Docker.
 
-## 2. Decisão estruturante: integrar com o GitHub Actions, não reimplementá-lo
+A dificuldade não está em nenhuma peça isolada. Está em **ligar as peças com verificação em cada
+junta**: a detecção pode errar, o Dockerfile gerado pode não buildar, o container pode subir e
+não responder, o provider pode aceitar e depois derrubar. O Deplora é, antes de tudo, o loop
+**analisar → construir → testar → subir → acompanhar**, com diagnóstico e correção proposta em
+cada ponto de falha.
 
-A parte mais cara de um PaaS é o *build* — detectar linguagem, montar imagem, cachear
-dependências. O GitHub Actions já faz isso bem, de graça, na máquina do GitHub. Então o Deplora
-**publica uma Action oficial** (`uses: deplora/deploy@v1`) e recebe o artefato pronto.
+## 2. Decisão estruturante: baixo nível por dentro, zero conceito de infra por fora
 
-O que isso compra: o Deplora começa no ponto em que a imagem existe. O que isso custa: dependência
-do GitHub como ponto de partida (aceitável — é onde o código está) e a obrigação de manter a Action
-compatível com versões de workflow (resolvido com versionamento semântico da Action).
+O Deplora é construído **sem as abstrações que escondem o que vale a pena aprender** — nem
+Buildpacks, nem `docker` CLI por subprocess, nem SDK de provider, nem Ansible. Em troca, a
+interface não exige nenhum conceito de infra da pessoa.
 
-**Fronteira de escopo:** o Deplora não interpreta YAML de workflow. Se isso mudar, é outro produto.
+O custo: cada peça é mais trabalhosa de construir e de manter do que seria com a abstração
+pronta. O ganho: controle total sobre o comportamento (essencial pra explicar cada passo e pra
+diagnosticar falhas com precisão), e o aprendizado — que é o objetivo declarado do projeto.
 
-## 3. Os três runtimes — cada um onde é a escolha certa
+Isso não é dogma. A régua é *"esta abstração esconde algo que eu quero aprender?"*. HTTP client,
+JSON, SSH **cliente** (a biblioteca, não o protocolo à mão), o driver de banco — essas não
+escondem nada que interesse aqui, e entram.
 
-A restrição é de aprendizado (duas pós), mas a regra é de engenharia: nenhum runtime entra por
-decreto. Cada um tem que estar onde um engenheiro sênior o colocaria sem saber da restrição.
+## 3. As peças
 
 ```mermaid
 flowchart TB
-    subgraph edge["fora do Deplora"]
-        GH["GitHub Actions<br/>(build da imagem)"]
-        REG["Registry<br/>(GHCR / Docker Hub)"]
-        USER["Navegador"]
+    subgraph pessoa["a pessoa"]
+        CLI["npx deplora<br/>(terminal)"]
+        WEB["navegador"]
     end
     subgraph deplora["Deplora"]
-        CP["control-plane<br/><b>Spring Boot</b><br/>API · domínio · persistência"]
-        Q[["fila<br/>(deploy requested)"]]
-        RN["runner<br/><b>Quarkus nativo</b><br/>1 por nó"]
-        GW["gateway<br/><b>Node.js</b><br/>WebSocket · logs · métricas"]
-        BR["cérebro<br/><b>LLM + MCP</b><br/>diagnóstico · agente"]
+        CP["<b>control plane</b> · Spring Boot<br/>projetos · planos · conexões · histórico"]
+        RN["<b>runner</b> · Quarkus nativo<br/>analisar · gerar Dockerfile · build · run · health · subir"]
+        GW["<b>gateway</b> · Node.js<br/>logs de build e boot ao vivo"]
+        BR["<b>cérebro</b> · LLM<br/>ambiguidade · Dockerfile inicial · diagnóstico"]
         PG[("Postgres")]
     end
-    DOCK["Docker daemon / K8s"]
+    subgraph fora["fora"]
+        GIT["repositório<br/>(GitHub)"]
+        DOCK["Docker daemon<br/>(socket Unix)"]
+        PROV["provider<br/>VPS · Fly · Railway · AWS"]
+    end
 
-    GH -- "1 · push da imagem" --> REG
-    GH -- "2 · webhook: imagem pronta" --> CP
-    CP -- "3 · enfileira" --> Q
-    Q -- "4 · consome" --> RN
-    RN -- "5 · pull + run + health" --> DOCK
-    REG -. "pull" .-> DOCK
-    RN -- "6 · eventos: building/live/failed" --> CP
+    CLI -- "URL do repo" --> CP
+    CP -- "job: analisar" --> RN
+    RN -- "clone" --> GIT
+    RN -- "plano proposto" --> CP
+    CP -- "plano em português" --> CLI
+    CLI -- "aprova" --> CP
+    CP -- "job: construir + testar" --> RN
+    RN -- "HTTP: build · create · start · logs · wait" --> DOCK
+    DOCK -- "stream" --> GW
+    GW -- "ws" --> WEB
+    GW -- "stdout" --> CLI
+    RN -- "SSH / HTTP" --> PROV
+    RN -- "falhou: log + Dockerfile + plano" --> BR
+    BR -- "causa + correção" --> CP
     CP --> PG
-    DOCK -- "7 · stdout/stderr" --> GW
-    GW -- "8 · ws push" --> USER
-    CP -- "9 · falhou: log + diff + histórico" --> BR
-    BR -- "10 · causa + proposta" --> CP
-    USER -- "aprova" --> CP
 ```
 
-### 3.1 Control plane — Spring Boot
+### 3.1 Runner — Quarkus nativo · o núcleo de baixo nível
 
-O único serviço com domínio rico: `App`, `Environment`, `Deploy`, `Release`, `Secret`. É onde vivem
-as regras — um deploy não pula de `Queued` para `Live`; um `Secret` nunca é lido de volta; um
-rollback é a promoção de uma `Release` anterior, não um deploy novo.
+É onde o projeto acontece. O runner:
 
-- **DDD**: bounded contexts Identidade · Aplicações · Deploy · Observabilidade. `Deploy` não conhece `User`.
-- **Arquitetura limpa**: `domain` sem Spring; `application` com casos de uso e ports; `infrastructure`
-  com JPA/Postgres e o cliente da fila; `presentation` com os controllers. ArchUnit garante a direção
-  das dependências no CI.
-- **Padrões que entram por necessidade, não por catálogo**: State (ciclo de vida do deploy),
-  Strategy (rollout: recreate / blue-green / canary), Observer (eventos de domínio → fila),
-  Builder (spec do container).
+- **analisa** o repositório: percorre a árvore, lê manifestos (`package.json`, `pom.xml`,
+  `build.gradle(.kts)`, `requirements.txt`/`pyproject.toml`, `go.mod`), procura a porta no código,
+  detecta `.env.example` e referências a variáveis, identifica dependências de serviço;
+- **gera** o Dockerfile (multi-stage, imagem base na versão detectada, non-root, sem `latest`) e
+  o valida antes de usar;
+- **constrói** pela Docker Engine API: empacota o contexto em tar, `POST /build`, lê o stream
+  JSON linha a linha;
+- **testa**: `POST /containers/create` → `/start` → `/logs` (stream multiplexado) → health na
+  porta detectada → `/stop` → `/rm`;
+- **sobe** no provider via o port `Provider` (SSH para VPS; HTTP cru para os demais).
 
-### 3.2 Runner — Quarkus nativo (GraalVM)
+Roda na máquina da pessoa (via `npx deplora`) ou num nó descartável do control plane. Por isso
+nativo: sobe em milissegundos, pesa pouco, morre sem dó.
 
-Um processo por nó de execução. Ele só sabe fazer uma coisa: pegar um `DeployRequested` da fila,
-dar `pull`, subir o container, esperar o health check, trocar a rota, e reportar eventos. Precisa
-subir em milissegundos (é escalado e morto com frequência) e usar pouca memória (roda ao lado
-dos containers que serve). **Esse é exatamente o perfil para o qual o Quarkus nativo existe** — e a
-comparação startup/memória contra uma versão Spring do mesmo runner é um artigo que vai sair daqui.
+### 3.2 Control plane — Spring Boot
 
-### 3.3 Gateway — Node.js
+Domínio: `Projeto`, `Plano` (a análise aprovada), `ConexaoDeProvider`, `Deploy`, `Historico`.
+Regras: um `Plano` só vira `Deploy` depois de aprovado; uma `ConexaoDeProvider` guarda **como**
+falar com o provider, nunca o segredo em claro; um `Deploy` tem ciclo de vida com transições
+válidas e eventos, não coluna de status.
 
-Logs e métricas de N containers para M navegadores, ao vivo. I/O intensivo, milhares de conexões
-persistentes, quase nenhum CPU por conexão: o caso canônico do event loop. O problema de
-engenharia real aqui é **backpressure** — um navegador lento não pode represar o log de um
-container rápido. O dashboard React vive no mesmo mundo.
+Arquitetura limpa: `domain` sem framework · `application` com casos de uso e ports ·
+`infrastructure` (JPA, fila, clientes) · `presentation` (REST). ArchUnit vigia a direção das
+dependências no CI.
 
-### 3.4 A Action — Node.js
+### 3.3 CLI e gateway — Node.js
 
-GitHub Actions roda JavaScript nativamente. A Action é pequena por desenho: valida inputs, chama
-a API do control plane, espera o deploy terminar e reporta no check do PR.
+`npx deplora` é a porta de entrada: quem faz vibe coding já tem o terminal aberto. O CLI conversa
+com o control plane, mostra o plano, pede aprovação, e **faz stream do build e do boot** em tempo
+real — é a mesma peça que, como gateway WebSocket, alimenta o navegador. Backpressure é o
+problema de engenharia real aqui: um cliente lento não pode represar o log de um build rápido.
 
-### 3.5 Cérebro — LLM + MCP
+### 3.4 Cérebro — LLM
 
-Quando um deploy falha, o control plane monta um contexto (últimas N linhas do log, diff do commit,
-os últimos K deploys do app) e pede ao agente **causa provável + correção proposta**. O agente
-**propõe**; um humano aprova; o runner executa; o resultado do re-deploy é o **verificador externo**
-— o agente não dá nota ao próprio diagnóstico. Evals com um dataset de falhas reais rotuladas
-existem antes do prompt ser otimizado. O MCP server expõe `list_deploys`, `get_logs`, `diagnose`
-para agentes externos.
+Entra em três lugares, e em nenhum outro:
 
-## 4. Comunicação: síncrono onde precisa de resposta, fila onde precisa de durabilidade
+1. **Ambiguidade na análise** — "é um monorepo? qual é o serviço web? esse script de start é o
+   certo?" — quando os manifestos não bastam. Com o contexto mínimo necessário, não o repo inteiro.
+2. **Primeiro Dockerfile** — quando a stack detectada não tem gerador determinístico. O código
+   valida sintaxe e políticas; **o build decide** se ele estava certo.
+3. **Diagnóstico** — log + Dockerfile + plano → causa provável + correção proposta. A pessoa
+   aprova; o runner aplica; o build/boot/provider confirma.
+
+Invariantes: o LLM **nunca** executa (só propõe); **nunca** dá nota ao próprio trabalho (o
+verificador é a realidade); **nunca** recebe segredos; tem budget de tokens e timeout por
+chamada; e existem **evals** — um dataset de repositórios reais e de falhas reais rotuladas —
+antes de qualquer prompt ser otimizado.
+
+## 4. O port `Provider`
+
+```
+Provider
+  conectar(credenciais) → Conexao          # valida, nunca persiste o segredo em claro
+  subir(Conexao, Imagem, Plano) → Endereco  # idempotente por (projeto, versão)
+  status(Conexao, Endereco) → Saude
+  logs(Conexao, Endereco) → Stream
+  derrubar(Conexao, Endereco)               # só com aprovação explícita
+```
+
+Primeira implementação: **VPS via SSH** — o mais baixo nível (conexão, chave, `exec`, instalar
+Docker se faltar, `docker load`/`run` remoto, proxy reverso com TLS). Segunda: Fly.io ou Railway
+por HTTP cru. A prova de que o port é bom: **a segunda implementação não exige mudar nada fora
+dela.** Terceira: AWS.
+
+## 5. Comunicação
 
 | Caminho | Tipo | Por quê |
 |---|---|---|
-| Actions → control plane (webhook) | HTTP síncrono | o Actions precisa de 2xx para marcar o step |
-| control plane → runner | **fila** | deploy não pode se perder se o runner estiver reiniciando; permite N runners |
-| runner → control plane (eventos) | **fila** | idempotência por `deployId + seq`; reconciliação se chegar fora de ordem |
-| containers → gateway → navegador | stream | WebSocket com backpressure; o gateway descarta para o cliente lento, nunca para o produtor |
-| control plane → cérebro | HTTP síncrono com timeout + budget de tokens | diagnóstico é best-effort; o deploy já falhou, nada depende da resposta chegar |
+| CLI ↔ control plane | HTTP | pedidos curtos, resposta imediata |
+| control plane → runner | **fila** | um job de análise/build não pode se perder; N runners |
+| runner → control plane (eventos) | **fila**, idempotente por `deployId + seq` | reconciliação se chegar fora de ordem |
+| runner → Docker | HTTP sobre socket Unix | é a Engine API; sem CLI no meio |
+| build/boot → gateway → CLI/navegador | stream | WebSocket com backpressure |
+| runner → provider | SSH ou HTTP | depende do provider; atrás do port |
+| control plane → cérebro | HTTP com timeout + budget | best-effort; nada bloqueia esperando o LLM |
 
-## 5. O que foi considerado e descartado
+## 6. O que foi considerado e descartado
 
 | Ideia | Por que não |
 |---|---|
-| Reimplementar o executor de workflows do Actions | segundo produto; o build é a parte mais cara e o GitHub já faz |
-| Tudo em um runtime só (Spring) | funcionaria — mas o runner ficaria pesado onde precisa ser leve, e o gateway de logs em Servlet/threads é o jeito errado de fazer I/O intensivo |
-| Kubernetes desde o dia 1 | complexidade que não ensina nada na fase 1; o runner fala com Docker primeiro e K8s depois, atrás do mesmo port |
-| Status do deploy como coluna persistida | dado derivado desatualiza; status vem dos eventos do runner, e o control plane reconcilia |
-| O agente aplicar rollback sozinho | nunca. Propõe, pede permissão, executa. Humor zero nesse caminho |
-| Multi-agente para o diagnóstico | começa como workflow fixo (contexto → causa → proposta); só vira grafo se um sinal de escalada aparecer — e esse sinal é medido por eval, não por intuição |
+| Ser um PaaS (hospedar o app) — a visão original | hospedar é commodity e infra pesada; o valor está em **transformar repositório em deploy, em qualquer lugar**. Decisão #006 |
+| Receber imagem pronta do Actions como única entrada | exclui exatamente o público-alvo (quem não tem Dockerfile nem workflow). O Actions vira um caminho alternativo, fase 8 |
+| Buildpacks / Nixpacks para detectar e buildar | resolvem o problema e escondem tudo que vale aprender; e quando erram, erram opaco |
+| `docker` CLI por subprocess | funciona — e esconde contexto, tar, stream e ciclo de vida, que são o aprendizado |
+| SDK oficial dos providers | um port `Provider` com clientes HTTP próprios é mais trabalho e é o ponto |
+| Kubernetes desde o dia 1 | complexidade que não ensina nada na fase 1; o provider é quem orquestra em produção |
+| Status do deploy como coluna persistida | dado derivado desatualiza; vem dos eventos do runner |
+| O agente aplicar correção ou rollback sozinho | nunca. Propõe → pede permissão → executa |
+| Multi-agente para o diagnóstico | começa como workflow fixo; só vira grafo se um sinal de escalada aparecer — medido por eval |
+| Persistir segredos da pessoa | nunca em claro; detecta o que falta, pede, injeta no provider |
 
-## 6. Observabilidade do próprio Deplora
+## 7. Observabilidade do próprio Deplora
 
-O Deplora é observado pelas mesmas ferramentas que ele oferece: o gateway faz stream dos logs do
-control plane e do runner; métricas via Micrometer/Prometheus; traces OpenTelemetry ligando o
-webhook ao evento `Live`. O dashboard 0 do projeto é o Deplora olhando para si mesmo.
-
-## 7. Roadmap detalhado
-
-Ver o README. A ordem existe por um motivo: **cada fase introduz um runtime ou um conceito**, e
-nunca dois ao mesmo tempo — assim, quando algo quebra, só há um suspeito.
+O runner e o control plane emitem métricas (Micrometer/Prometheus) e traces (OpenTelemetry)
+ligando "URL colada" a "no ar". O dashboard 0 é o Deplora olhando para si mesmo.
 
 ## 8. Decisões registradas (ADRs)
 
-| # | Decisão | Data |
-|---|---|---|
-| 001 | Integrar com GitHub Actions via Action oficial; não reimplementar o executor | 2026-08-17 |
-| 002 | Três runtimes com papel arquitetural: Spring (control plane), Quarkus nativo (runner), Node (gateway + Action) | 2026-08-17 |
-| 003 | Fila entre control plane e runner; eventos idempotentes por `deployId + seq` | 2026-08-17 |
-| 004 | Agente de IA propõe, nunca executa sem aprovação; re-deploy é o verificador externo | 2026-08-17 |
-| 005 | Identidade: a gota com caret recortado; âmbar sobre tinta; mono como voz | 2026-08-19 |
+| # | Decisão | Data | Estado |
+|---|---|---|---|
+| 001 | Integrar com GitHub Actions via Action oficial; não reimplementar o executor | 2026-08-17 | **substituída por #006** — o Actions vira caminho alternativo (fase 8), não a entrada principal |
+| 002 | Três runtimes com papel arquitetural: Spring (control plane), Quarkus nativo (runner), Node (gateway) | 2026-08-17 | vigente; o Node ganha o CLI `npx deplora` |
+| 003 | Fila entre control plane e runner; eventos idempotentes por `deployId + seq` | 2026-08-17 | vigente |
+| 004 | Agente de IA propõe, nunca executa sem aprovação; a realidade é o verificador externo | 2026-08-17 | vigente, ampliada: o LLM também escreve o Dockerfile inicial e resolve ambiguidade de análise — sob as mesmas regras |
+| 005 | Identidade: a gota com caret recortado; âmbar sobre tinta; mono como voz | 2026-08-19 | vigente |
+| **006** | **O Deplora é um agente de deploy, não um PaaS**: entrada é a URL do repositório; ele analisa, gera o pipeline, constrói, testa e sobe no provider que a pessoa conectar. Construído em baixo nível (Docker Engine API, SSH, HTTP cru) por decisão de aprendizado; interface sem nenhum conceito de infra por decisão de produto | 2026-08-19 | vigente |
+| **007** | Público-alvo: quem faz vibe coding. Régua de interface: *se a pessoa precisou aprender um conceito de infra pra seguir, o Deplora falhou* | 2026-08-19 | vigente |
 
-_Novos ADRs entram aqui, um por decisão, com data. Decisões revertidas não são apagadas — ganham
-uma linha "substituída por #n"._
+_Novos ADRs entram aqui, um por decisão, com data. Decisões revertidas não são apagadas —
+ganham "substituída por #n"._
