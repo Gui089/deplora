@@ -142,6 +142,7 @@ dela.** Terceira: AWS.
 | Caminho | Tipo | Por quê |
 |---|---|---|
 | CLI ↔ control plane | HTTP | pedidos curtos, resposta imediata |
+| CLI → bucket (workspace local) | upload em chunks, S3-compatível | arquivo grande não trafega por API nem por fila; o job na fila só carrega a referência (ADR 008) |
 | control plane → runner | **fila** | um job de análise/build não pode se perder; N runners |
 | runner → control plane (eventos) | **fila**, idempotente por `deployId + seq` | reconciliação se chegar fora de ordem |
 | runner → Docker | HTTP sobre socket Unix | é a Engine API; sem CLI no meio |
@@ -175,11 +176,13 @@ ligando "URL colada" a "no ar". O dashboard 0 é o Deplora olhando para si mesmo
 |---|---|---|---|
 | 001 | Integrar com GitHub Actions via Action oficial; não reimplementar o executor | 2026-08-17 | **substituída por #006** — o Actions vira caminho alternativo (fase 8), não a entrada principal |
 | 002 | Três runtimes com papel arquitetural: Spring (control plane), Quarkus nativo (runner), Node (gateway) | 2026-08-17 | vigente; o Node ganha o CLI `npx deplora` |
-| 003 | Fila entre control plane e runner; eventos idempotentes por `deployId + seq` | 2026-08-17 | vigente |
+| 003 | Fila entre control plane e runner; eventos idempotentes por `deployId + seq` | 2026-08-17 | vigente; implementação escolhida em 21/08: **RabbitMQ** — o Deplora é open source e self-hostável, e a fila precisa rodar em qualquer lugar (inclusive no compose local), o que descarta amarrar a SQS/AWS. FIFO por projeto. *(Nota honesta: circuit breaker não entrou na decisão — é padrão do consumidor, não feature de fila.)* |
 | 004 | Agente de IA propõe, nunca executa sem aprovação; a realidade é o verificador externo | 2026-08-17 | vigente, ampliada: o LLM também escreve o Dockerfile inicial e resolve ambiguidade de análise — sob as mesmas regras |
 | 005 | Identidade: a gota com caret recortado; âmbar sobre tinta; mono como voz | 2026-08-19 | vigente |
 | **006** | **O Deplora é um agente de deploy, não um PaaS**: entrada é a URL do repositório; ele analisa, gera o pipeline, constrói, testa e sobe no provider que a pessoa conectar. Construído em baixo nível (Docker Engine API, SSH, HTTP cru) por decisão de aprendizado; interface sem nenhum conceito de infra por decisão de produto | 2026-08-19 | vigente |
 | **007** | Público-alvo: quem faz vibe coding. Régua de interface: *se a pessoa precisou aprender um conceito de infra pra seguir, o Deplora falhou* | 2026-08-19 | vigente |
+
+| **008** | **Projeto local sem Git remoto é entrada de primeira classe**: quem faz vibe coding muitas vezes só tem a pasta no localhost. O `npx deplora` empacota o workspace (respeitando `.gitignore`), envia em **chunks para o bucket** (S3-compatível), e o runner consome o job pela fila e remonta. Clonar de URL continua sendo o outro caminho — os dois convergem no mesmo ponto: um workspace no bucket que o runner analisa | 2026-08-21 | vigente |
 
 _Novos ADRs entram aqui, um por decisão, com data. Decisões revertidas não são apagadas —
 ganham "substituída por #n"._
